@@ -324,6 +324,149 @@ class MemoryManager(nn.Module):
 
 Config = namedtuple('EfficientAttentionConfig', ['enable_flash', 'enable_math', 'enable_mem_efficient'])
 
+# state container
+
+class StateContainer(nn.Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        num_state_vectors,
+        dim_head = 64,
+        heads = 8,
+        qk_rmsnorm = False,
+        qk_rmsnorm_scale = 8,
+        use_flash_attn = False
+    ):
+        super().__init__()
+        assert num_state_vectors > 0
+        self.heads = heads
+        inner_dim = dim_head * heads
+
+        self.state_norm = LayerNorm(dim)
+
+        self.q_to_state = nn.Linear(dim, inner_dim, bias = False)
+        self.q_from_state = nn.Linear(dim, inner_dim, bias = False)
+
+        self.state_to_q = nn.Linear(dim, inner_dim, bias = False)
+        self.state_to_kv = nn.Linear(dim, dim_head * 2, bias = False)
+
+        self.init_state = nn.Parameter(torch.randn(num_state_vectors, dim))
+        self.state_pos_ids = nn.Parameter(torch.randn(num_state_vectors, dim))
+
+        self.to_state_out = nn.Linear(inner_dim * 2, dim, bias = False)
+
+        self.to_state_cross_attn = Attention(dim_head, qk_rmsnorm = qk_rmsnorm, qk_rmsnorm_scale = qk_rmsnorm_scale, use_flash_attn = use_flash_attn)
+
+        self.state_self_attn = Attention(dim_head, qk_rmsnorm = qk_rmsnorm, qk_rmsnorm_scale = qk_rmsnorm_scale, use_flash_attn = use_flash_attn)
+        self.from_state_cross_attn = Attention(dim_head, qk_rmsnorm = qk_rmsnorm, qk_rmsnorm_scale = qk_rmsnorm_scale, use_flash_attn = use_flash_attn)
+
+        # gating related parameters - using the fixed simple config
+
+        self.state_out_to_gate = nn.Linear(dim, dim)
+        self.learned_ema_beta = nn.Parameter(torch.randn(dim))
+
+        # since each read should be followed by a write, just store cache in the container
+
+        self.cache = None
+        self.next_read_state = None
+
+    def set_next_read_state(
+        self,
+        states
+    ):
+        if not exists(states):
+            states = self.init_state
+
+        self.next_read_state = (states,)
+
+    def read(self, x):
+        assert exists(self.next_read_state), 'states to be read must be set with .set_next_read_state'
+
+        states, = self.next_read_state
+        self.next_read_state = None
+
+        # pre norm state for attention
+
+        normed_states = self.state_norm(states)
+
+        # add the positional ids, as stated in the paper critical for it to work
+
+        normed_states = normed_states + self.state_pos_ids
+
+        # get queries for cross attention, which they do not share, although they share key / values. another intriguing detail
+
+        q_to_state = self.q_to_state(x)
+        q_to_state = rearrange(q_to_state, '... n (h d) -> ... h n d', h = self.heads)
+
+        # self attention qkv for states
+
+        state_k, state_v = self.state_to_kv(normed_states).chunk(2, dim = -1)
+
+        # cross attend to the past states key values
+
+        to_state_out = self.to_state_cross_attn(q_to_state, state_k, state_v)
+
+        to_state_out = rearrange(to_state_out, 'b h n d -> b n (h d)')
+
+        # cache for next write
+
+        self.cache = (states, normed_states, state_k, state_v)
+
+        return to_state_out
+
+    def write(
+        self,
+        *,
+        memories
+    ):
+        assert exists(self.cache)
+
+        k, v = memories
+        batch = k.shape[0]
+
+        # get cached values from the previous read
+
+        states, normed_states, state_k, state_v = self.cache
+
+        self.cache = None
+
+        # derive queries
+
+        q_from_state = self.q_from_state(normed_states)
+        q_from_state = rearrange(q_from_state, '... n (h d) -> ... h n d', h = self.heads)
+
+        state_q = self.state_to_q(normed_states)
+        state_q_einsum = 'n (h d)' if state_q.ndim == 2 else 'b n (h d)'
+        state_q = repeat(state_q, f'{state_q_einsum} -> b h n d', h = self.heads, b = batch)
+
+        # states must also undergo self attention
+
+        if q_from_state.ndim == 3:
+            q_from_state = repeat(q_from_state, '... -> b ...', b = batch)
+
+        state_out = self.state_self_attn(state_q, state_k, state_v)
+
+        from_state_out = self.from_state_cross_attn(q_from_state, k, v)
+
+        state_out = torch.cat((state_out, from_state_out), dim = -1)
+        state_out = rearrange(state_out, 'b h n d -> b n (h d)')
+
+        state_out = self.to_state_out(state_out)
+
+        # use the best performing configuration
+        # fixed simple gate - nothing more than a learned EMA with some resemblance to highway networks
+
+        z = self.state_out_to_gate(state_out)
+        learned_ema_decay = self.learned_ema_beta.sigmoid()
+
+        # set new state with the learned EMA gating
+
+        return learned_ema_decay * z + (1 - learned_ema_decay) * states
+
+    def forward(self, x):
+        raise NotImplementedError
+
 # main class
 
 class Attend(nn.Module):
