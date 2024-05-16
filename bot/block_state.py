@@ -193,23 +193,27 @@ def apply_rotary_pos_emb(t, pos, scale = 1.):
     return (t * pos.cos() * scale) + (rotate_half(t) * pos.sin() * scale)
 
 # SSM Layer (State Space Model)
-class SSMLayer(nn.Module):
-    def __init__(self, dim, seq_len, n_ssm=8):
-        super().__init__()
-        self.dim = dim
-        self.seq_len = seq_len
+class S4Layer(nn.Module):
+    def __init__(self, d_model, n_ssm=8):
+        super(S4Layer, self).__init__()
+        self.d_model = d_model
         self.n_ssm = n_ssm
 
-        self.ssms = nn.ModuleList([nn.Linear(dim, dim) for _ in range(n_ssm)])
+        self.ssms = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_ssm)])
         self.scale = nn.Parameter(torch.ones(n_ssm))
 
     def forward(self, x):
-        seq_len = x.shape[-2]
+        batch_size, seq_len, dim = x.shape
+        assert dim == self.d_model, f"Input dimension ({dim}) does not match layer dimension ({self.d_model})"
+
         context_seq = torch.zeros_like(x)
 
         for i in range(self.n_ssm):
             ssm = self.ssms[i]
-            context_seq = context_seq + self.scale[i] * ssm(x)
+            reshaped_x = x.view(-1, dim)  # (batch_size * seq_len, dim)
+            transformed_x = ssm(reshaped_x)  # Perform linear transformation
+            transformed_x = transformed_x.view(batch_size, seq_len, dim)  # (batch_size, seq_len, dim)
+            context_seq = context_seq + self.scale[i] * transformed_x
 
         return context_seq
 
@@ -324,148 +328,141 @@ class MemoryManager(nn.Module):
 
 Config = namedtuple('EfficientAttentionConfig', ['enable_flash', 'enable_math', 'enable_mem_efficient'])
 
-# # state container
+# state container
 
-# class StateContainer(nn.Module):
-#     def __init__(
-#         self,
-#         dim,
-#         *,
-#         num_state_vectors,
-#         dim_head = 64,
-#         heads = 8,
-#         qk_rmsnorm = False,
-#         qk_rmsnorm_scale = 8,
-#         use_flash_attn = False
-#     ):
-#         super().__init__()
-#         assert num_state_vectors > 0
-#         self.heads = heads
-#         inner_dim = dim_head * heads
+class StateContainer(nn.Module):
+    def __init__(
+        self,
+        dim,
+        *,
+        num_state_vectors,
+        dim_head = 64,
+        heads = 8,
+        qk_rmsnorm = False,
+        qk_rmsnorm_scale = 8,
+        use_flash_attn = False,
+        s4_n_ssm = 8
+    ):
+        super().__init__()
+        assert num_state_vectors > 0
+        self.heads = heads
+        inner_dim = dim_head * heads
 
-#         self.state_norm = LayerNorm(dim)
+        self.state_norm = LayerNorm(dim)
 
-#         self.q_to_state = nn.Linear(dim, inner_dim, bias = False)
-#         self.q_from_state = nn.Linear(dim, inner_dim, bias = False)
+        self.q_to_state = nn.Linear(dim, inner_dim, bias = False)
+        self.q_from_state = nn.Linear(dim, inner_dim, bias = False)
 
-#         self.state_to_q = nn.Linear(dim, inner_dim, bias = False)
-#         self.state_to_kv = nn.Linear(dim, dim_head * 2, bias = False)
+        self.state_to_q = nn.Linear(dim, inner_dim, bias = False)
+        self.state_to_kv = nn.Linear(dim, dim_head * 2, bias = False)
 
-#         self.init_state = nn.Parameter(torch.randn(num_state_vectors, dim))
-#         self.state_pos_ids = nn.Parameter(torch.randn(num_state_vectors, dim))
+        self.init_state = nn.Parameter(torch.randn(num_state_vectors, dim))
+        self.state_pos_ids = nn.Parameter(torch.randn(num_state_vectors, dim))
 
-#         self.to_state_out = nn.Linear(inner_dim * 2, dim, bias = False)
+        self.to_state_out = nn.Linear(inner_dim * 2, dim, bias = False)
 
-#         self.to_state_cross_attn = Attention(dim_head, qk_rmsnorm = qk_rmsnorm, qk_rmsnorm_scale = qk_rmsnorm_scale, use_flash_attn = use_flash_attn)
+        self.to_state_cross_attn = Attention(dim_head, qk_rmsnorm=qk_rmsnorm, qk_rmsnorm_scale=qk_rmsnorm_scale, use_flash_attn=use_flash_attn)
 
-#         self.state_self_attn = Attention(dim_head, qk_rmsnorm = qk_rmsnorm, qk_rmsnorm_scale = qk_rmsnorm_scale, use_flash_attn = use_flash_attn)
-#         self.from_state_cross_attn = Attention(dim_head, qk_rmsnorm = qk_rmsnorm, qk_rmsnorm_scale = qk_rmsnorm_scale, use_flash_attn = use_flash_attn)
+        self.state_self_attn = Attention(dim_head, qk_rmsnorm=qk_rmsnorm, qk_rmsnorm_scale=qk_rmsnorm_scale, use_flash_attn=use_flash_attn)
+        self.from_state_cross_attn = Attention(dim_head, qk_rmsnorm=qk_rmsnorm, qk_rmsnorm_scale=qk_rmsnorm_scale, use_flash_attn=use_flash_attn)
 
-#         # gating related parameters - using the fixed simple config
+        # S4 layer
+        self.s4_layer = S4Layer(dim, n_ssm=s4_n_ssm)
 
-#         self.state_out_to_gate = nn.Linear(dim, dim)
-#         self.learned_ema_beta = nn.Parameter(torch.randn(dim))
+        # gating related parameters - using the fixed simple config
+        self.state_out_to_gate = nn.Linear(dim, dim)
+        self.learned_ema_beta = nn.Parameter(torch.randn(dim))
 
-#         # since each read should be followed by a write, just store cache in the container
+        # since each read should be followed by a write, just store cache in the container
+        self.cache = None
+        self.next_read_state = None
 
-#         self.cache = None
-#         self.next_read_state = None
+    def set_next_read_state(
+        self,
+        states
+    ):
+        if not exists(states):
+            states = self.init_state
 
-#     def set_next_read_state(
-#         self,
-#         states
-#     ):
-#         if not exists(states):
-#             states = self.init_state
+        self.next_read_state = (states,)
 
-#         self.next_read_state = (states,)
+    def read(self, x):
+        assert exists(self.next_read_state), 'states to be read must be set with .set_next_read_state'
 
-#     def read(self, x):
-#         assert exists(self.next_read_state), 'states to be read must be set with .set_next_read_state'
+        states, = self.next_read_state
+        self.next_read_state = None
 
-#         states, = self.next_read_state
-#         self.next_read_state = None
+        # pre norm state for attention
+        normed_states = self.state_norm(states)
 
-#         # pre norm state for attention
+        # add the positional ids, as stated in the paper critical for it to work
+        normed_states = normed_states + self.state_pos_ids
 
-#         normed_states = self.state_norm(states)
+        # get queries for cross attention, which they do not share, although they share key / values. another intriguing detail
+        q_to_state = self.q_to_state(x)
+        q_to_state = rearrange(q_to_state, '... n (h d) -> ... h n d', h=self.heads)
 
-#         # add the positional ids, as stated in the paper critical for it to work
+        # self attention qkv for states
+        state_k, state_v = self.state_to_kv(normed_states).chunk(2, dim=-1)
 
-#         normed_states = normed_states + self.state_pos_ids
+        # cross attend to the past states key values
+        to_state_out = self.to_state_cross_attn(q_to_state, state_k, state_v)
+        to_state_out = rearrange(to_state_out, 'b h n d -> b n (h d)')
 
-#         # get queries for cross attention, which they do not share, although they share key / values. another intriguing detail
+        # cache for next write
+        self.cache = (states, normed_states, state_k, state_v)
 
-#         q_to_state = self.q_to_state(x)
-#         q_to_state = rearrange(q_to_state, '... n (h d) -> ... h n d', h = self.heads)
+        return to_state_out
 
-#         # self attention qkv for states
+    def write(
+        self,
+        *,
+        memories
+    ):
+        assert exists(self.cache)
 
-#         state_k, state_v = self.state_to_kv(normed_states).chunk(2, dim = -1)
+        k, v = memories
+        batch = k.shape[0]
 
-#         # cross attend to the past states key values
+        # get cached values from the previous read
+        states, normed_states, state_k, state_v = self.cache
+        self.cache = None
 
-#         to_state_out = self.to_state_cross_attn(q_to_state, state_k, state_v)
+        # derive queries
+        q_from_state = self.q_from_state(normed_states)
+        q_from_state = rearrange(q_from_state, '... n (h d) -> ... h n d', h=self.heads)
 
-#         to_state_out = rearrange(to_state_out, 'b h n d -> b n (h d)')
+        state_q = self.state_to_q(normed_states)
+        state_q_einsum = 'n (h d)' if state_q.ndim == 2 else 'b n (h d)'
+        state_q = repeat(state_q, f'{state_q_einsum} -> b h n d', h=self.heads, b=batch)
 
-#         # cache for next write
+        # states must also undergo self attention
+        if q_from_state.ndim == 3:
+            q_from_state = repeat(q_from_state, '... -> b ...', b=batch)
 
-#         self.cache = (states, normed_states, state_k, state_v)
+        state_out = self.state_self_attn(state_q, state_k, state_v)
+        from_state_out = self.from_state_cross_attn(q_from_state, k, v)
 
-#         return to_state_out
+        state_out = torch.cat((state_out, from_state_out), dim=-1)
+        state_out = rearrange(state_out, 'b h n d -> b n (h d)')
 
-#     def write(
-#         self,
-#         *,
-#         memories
-#     ):
-#         assert exists(self.cache)
+        state_out = self.to_state_out(state_out)
 
-#         k, v = memories
-#         batch = k.shape[0]
+        # use the best performing configuration
+        # fixed simple gate - nothing more than a learned EMA with some resemblance to highway networks
+        z = self.state_out_to_gate(state_out)
+        learned_ema_decay = self.learned_ema_beta.sigmoid()
 
-#         # get cached values from the previous read
+        # set new state with the learned EMA gating
+        new_state = learned_ema_decay * z + (1 - learned_ema_decay) * states
 
-#         states, normed_states, state_k, state_v = self.cache
+        # apply S4 layer to new_state
+        new_state = self.s4_layer(new_state)
 
-#         self.cache = None
+        return new_state
 
-#         # derive queries
-
-#         q_from_state = self.q_from_state(normed_states)
-#         q_from_state = rearrange(q_from_state, '... n (h d) -> ... h n d', h = self.heads)
-
-#         state_q = self.state_to_q(normed_states)
-#         state_q_einsum = 'n (h d)' if state_q.ndim == 2 else 'b n (h d)'
-#         state_q = repeat(state_q, f'{state_q_einsum} -> b h n d', h = self.heads, b = batch)
-
-#         # states must also undergo self attention
-
-#         if q_from_state.ndim == 3:
-#             q_from_state = repeat(q_from_state, '... -> b ...', b = batch)
-
-#         state_out = self.state_self_attn(state_q, state_k, state_v)
-
-#         from_state_out = self.from_state_cross_attn(q_from_state, k, v)
-
-#         state_out = torch.cat((state_out, from_state_out), dim = -1)
-#         state_out = rearrange(state_out, 'b h n d -> b n (h d)')
-
-#         state_out = self.to_state_out(state_out)
-
-#         # use the best performing configuration
-#         # fixed simple gate - nothing more than a learned EMA with some resemblance to highway networks
-
-#         z = self.state_out_to_gate(state_out)
-#         learned_ema_decay = self.learned_ema_beta.sigmoid()
-
-#         # set new state with the learned EMA gating
-
-#         return learned_ema_decay * z + (1 - learned_ema_decay) * states
-
-#     def forward(self, x):
-#         raise NotImplementedError
+    def forward(self, x):
+        raise NotImplementedError
 
 # main class
 
@@ -707,7 +704,15 @@ class AttentionBlock(nn.Module):
 
         self.state_read_before_write = state_read_before_write
 
-        self.ssm_layer = SSMLayer(dim, block_width)
+        self.state_container = StateContainer(
+            dim,
+            dim_head = dim_head,
+            heads = heads,
+            num_state_vectors = num_state_vectors,
+            qk_rmsnorm = qk_rmsnorm,
+            qk_rmsnorm_scale = qk_rmsnorm_scale,
+            use_flash_attn = use_flash_attn
+        )
 
     @property
     def device(self):
@@ -720,7 +725,7 @@ class AttentionBlock(nn.Module):
         xpos_scale = None,
         attn_mask = None,
         xl_memories: Optional[torch.Tensor] = None,
-        read_from_state_containers: List[SSMLayer] = []
+        read_from_state_containers: List[StateContainer] = []
     ):
         batch, seq_len, _, width, device = *x.shape, self.block_width, self.device
 
@@ -767,11 +772,6 @@ class AttentionBlock(nn.Module):
 
         out = rearrange(out, 'b h n d -> b n (h d)')
 
-        # apply SSM
-
-        if self.is_recurrent_layer:
-            out = self.ssm_layer(out)
-
         # early return if not a recurrent layer
 
         if not self.is_recurrent_layer and len(read_from_state_containers) == 0:
@@ -780,7 +780,7 @@ class AttentionBlock(nn.Module):
         # whether to read from own state container, default to on, but may pass in more
 
         if self.is_recurrent_layer and self.state_read_before_write:
-            read_from_state_containers = [self.ssm_layer, *read_from_state_containers]
+            read_from_state_containers = [self.state_container, *read_from_state_containers]
 
         for read_state_container in read_from_state_containers:
             # read from the states ...
@@ -796,7 +796,7 @@ class AttentionBlock(nn.Module):
         if self.is_recurrent_layer:
             # then write to the states as well if need be
 
-            new_states = self.ssm_layer.write(memories = memories)
+            new_states = self.state_container.write(memories = memories)
 
         return self.to_out(out), memories, new_states
 
@@ -888,7 +888,7 @@ class BlockStateTransformer(nn.Module):
 
             if is_recurrent_layer:
                 read_layer = self.write_to_read_map[layer]
-                self.read_state_router[read_layer].append(attn_block.ssm_layer)
+                self.read_state_router[read_layer].append(attn_block.state_container)
 
             self.layers.append(nn.ModuleList([
                 attn_block,
@@ -1047,7 +1047,7 @@ class BlockStateTransformer(nn.Module):
                 if not attn.is_recurrent_layer:
                     continue
 
-                attn.ssm_layer.set_next_read_state(next(iter_states, None))
+                attn.state_container.set_next_read_state(next(iter_states, None))
 
             # go through layers
 
