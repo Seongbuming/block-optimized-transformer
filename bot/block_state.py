@@ -10,6 +10,7 @@ from packaging import version
 
 import torch
 import torch.nn.functional as F
+import torch.fft
 from torch import nn, einsum
 
 from einops import rearrange, repeat, pack, unpack
@@ -193,29 +194,114 @@ def apply_rotary_pos_emb(t, pos, scale = 1.):
     return (t * pos.cos() * scale) + (rotate_half(t) * pos.sin() * scale)
 
 # SSM Layer (State Space Model)
+# class S4Layer(nn.Module):
+#     def __init__(self, d_model, n_ssm=8):
+#         super(S4Layer, self).__init__()
+#         self.d_model = d_model
+#         self.n_ssm = n_ssm
+
+#         self.ssms = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_ssm)])
+#         self.scale = nn.Parameter(torch.ones(n_ssm))
+
+#     def forward(self, x):
+#         batch_size, seq_len, dim = x.shape
+#         assert dim == self.d_model, f"Input dimension ({dim}) does not match layer dimension ({self.d_model})"
+
+#         context_seq = torch.zeros_like(x)
+
+#         for i in range(self.n_ssm):
+#             ssm = self.ssms[i]
+#             reshaped_x = x.view(-1, dim)  # (batch_size * seq_len, dim)
+#             transformed_x = ssm(reshaped_x)  # Perform linear transformation
+#             transformed_x = transformed_x.view(batch_size, seq_len, dim)  # (batch_size, seq_len, dim)
+#             context_seq = context_seq + self.scale[i] * transformed_x
+
+#         return context_seq
+
+def check_for_nan(tensor, name):
+    if torch.isnan(tensor).any():
+        print(f"{name} contains NaN values")
+    return tensor
+
+def normalize(tensor, eps=1e-8):
+    return tensor / (tensor.norm(dim=-1, keepdim=True) + eps)
+
+def clamp_values(tensor, min_value=-1e4, max_value=1e4):
+    return torch.clamp(tensor, min=min_value, max=max_value)
+
 class S4Layer(nn.Module):
-    def __init__(self, d_model, n_ssm=8):
+    def __init__(self, d_model, state_size=64, seq_len=512, epsilon=1e-4):
         super(S4Layer, self).__init__()
         self.d_model = d_model
-        self.n_ssm = n_ssm
+        self.state_size = state_size
+        self.seq_len = seq_len
+        self.epsilon = epsilon
 
-        self.ssms = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_ssm)])
-        self.scale = nn.Parameter(torch.ones(n_ssm))
+        # Initialize HiPPO matrix and other parameters
+        self.A = self.init_hippo_matrix(state_size)
+        self.B = nn.Parameter(torch.randn(state_size, 1))
+        self.C = nn.Parameter(torch.randn(1, state_size))
+        self.D = nn.Parameter(torch.randn(1))
+
+        # Parameters for discretization
+        self.delta = nn.Parameter(torch.tensor(0.1))
+
+    def init_hippo_matrix(self, N):
+        P = torch.sqrt(1 + 2 * torch.arange(N, dtype=torch.float32))
+        A = -torch.tril(torch.outer(P, P))
+        A[torch.arange(N, dtype=torch.long), torch.arange(N, dtype=torch.long)] = torch.arange(N, dtype=torch.float32)
+        return nn.Parameter(A, requires_grad=False)
+
+    def discretize(self, A, B, delta):
+        I = torch.eye(A.size(0)).to(A.device)
+        regularization = self.epsilon * I
+        Ad = torch.linalg.pinv(I - 0.5 * delta * A + regularization) @ (I + 0.5 * delta * A)
+        Bd = torch.linalg.pinv(I - 0.5 * delta * A + regularization) @ (delta * B)
+        return Ad, Bd
+
+    def compute_kernel(self, Ad, Bd, C, seq_len):
+        K = []
+        CA_power = C
+        for i in range(seq_len):
+            K.append(CA_power @ Bd)
+            CA_power = CA_power @ Ad
+
+            CA_power = clamp_values(CA_power)
+            K[-1] = clamp_values(K[-1])
+
+            CA_power = normalize(CA_power)
+            K[-1] = normalize(K[-1])
+
+            CA_power = check_for_nan(CA_power, f"CA_power({C}, {Ad}) at step {i}")
+            K[-1] = check_for_nan(K[-1], f"K({C}, {Bd}) at step {i}")
+        return torch.cat(K, dim=-1)
 
     def forward(self, x):
-        batch_size, seq_len, dim = x.shape
-        assert dim == self.d_model, f"Input dimension ({dim}) does not match layer dimension ({self.d_model})"
+        batch_size, seq_len, _ = x.size()
 
-        context_seq = torch.zeros_like(x)
+        if torch.isnan(x).any():
+            print("Input x contains NaN values")
 
-        for i in range(self.n_ssm):
-            ssm = self.ssms[i]
-            reshaped_x = x.view(-1, dim)  # (batch_size * seq_len, dim)
-            transformed_x = ssm(reshaped_x)  # Perform linear transformation
-            transformed_x = transformed_x.view(batch_size, seq_len, dim)  # (batch_size, seq_len, dim)
-            context_seq = context_seq + self.scale[i] * transformed_x
+        # Discretize the SSM
+        Ad, Bd = self.discretize(self.A, self.B, self.delta)
 
-        return context_seq
+        if torch.isnan(Ad).any() or torch.isnan(Bd).any():
+            print("Ad or Bd contains NaN values after discretization")
+        
+        kernel = self.compute_kernel(Ad, Bd, self.C, seq_len)
+
+        if torch.isnan(kernel).any():
+            print("Kernel contains NaN values after computation")
+
+        # Perform convolution using FFT
+        fft_x = torch.fft.fft(x, n=seq_len, dim=-1)
+        fft_kernel = torch.fft.fft(kernel, n=seq_len)
+        output = torch.fft.ifft(fft_x * fft_kernel, dim=-1).real
+
+        if torch.isnan(output).any():
+            print("Output contains NaN values after FFT convolution")
+
+        return output + self.D * x
 
 # memory management
 
@@ -341,7 +427,8 @@ class StateContainer(nn.Module):
         qk_rmsnorm = False,
         qk_rmsnorm_scale = 8,
         use_flash_attn = False,
-        s4_n_ssm = 8
+        s4_n_ssm = 8,
+        seq_len = 512
     ):
         super().__init__()
         assert num_state_vectors > 0
@@ -367,7 +454,7 @@ class StateContainer(nn.Module):
         self.from_state_cross_attn = Attention(dim_head, qk_rmsnorm=qk_rmsnorm, qk_rmsnorm_scale=qk_rmsnorm_scale, use_flash_attn=use_flash_attn)
 
         # S4 layer
-        self.s4_layer = S4Layer(dim, n_ssm=s4_n_ssm)
+        self.s4_layer = S4Layer(dim, state_size=s4_n_ssm, seq_len=seq_len)
 
         # gating related parameters - using the fixed simple config
         self.state_out_to_gate = nn.Linear(dim, dim)
@@ -676,7 +763,9 @@ class AttentionBlock(nn.Module):
         use_flash_attn = False,
         num_state_vectors = 0,
         num_external_state_reads = 0,
-        state_read_before_write = True  # this will be defaulted to on as in the paper, but will be turned off in the case the researcher wants to test out reading the state at a lower layer
+        state_read_before_write = True,  # this will be defaulted to on as in the paper, but will be turned off in the case the researcher wants to test out reading the state at a lower layer
+        s4_n_ssm = 8, # number of SSMs in S4Layer
+        seq_len = 512 # sequence length for S4Layer
     ):
         super().__init__()
         inner_dim = dim_head * heads
@@ -711,7 +800,9 @@ class AttentionBlock(nn.Module):
             num_state_vectors = num_state_vectors,
             qk_rmsnorm = qk_rmsnorm,
             qk_rmsnorm_scale = qk_rmsnorm_scale,
-            use_flash_attn = use_flash_attn
+            use_flash_attn = use_flash_attn,
+            s4_n_ssm = s4_n_ssm,
+            seq_len = seq_len
         )
 
     @property
@@ -822,7 +913,8 @@ class BlockStateTransformer(nn.Module):
         ignore_index = -100,
         use_flash_attn = False,
         use_compressed_mem = False,
-        compressed_mem_factor = 4
+        compressed_mem_factor = 4,
+        s4_n_ssm = 8
     ):
         super().__init__()
         num_state_vectors = default(num_state_vectors, block_width)
@@ -882,6 +974,8 @@ class BlockStateTransformer(nn.Module):
                 use_flash_attn = use_flash_attn,
                 num_external_state_reads = num_external_state_reads,
                 state_read_before_write = False,
+                s4_n_ssm = s4_n_ssm,
+                seq_len = max_seq_len
             )
 
             ff_block = FeedForward(dim, mult = ff_mult)
