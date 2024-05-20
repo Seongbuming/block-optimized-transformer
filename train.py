@@ -52,11 +52,12 @@ model = BlockStateTransformer(
     depth = 6,
     dim_head = 64,
     heads = 8,
-    max_seq_len = 1024,
+    max_seq_len = 512,
     block_width = 512,
     num_state_vectors = 512,
     recurrent_layers = (4,),
-    use_flash_attn = True
+    use_flash_attn = True,
+    s4_n_ssm=64,
 )
 
 train_wrapper = RecurrentTrainerWrapper(
@@ -126,8 +127,8 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10.0, desc="training"):
         model.eval()
         inp = random.choice(val_dataset)[:PRIME_LENGTH]
         prime = decode_tokens(inp)
-        acc_print(f"%s \n\n %s", (prime, "*" * 100))
+        acc_print(f" prime: {prime}\n\n{'*' * 100}")
 
         sample = train_wrapper.generate(inp[None, ...], length = GENERATE_LENGTH)
         output_str = decode_tokens(sample[0])
-        acc_print(output_str, "\n")
+        acc_print(f" output_str: {output_str}\n\n")
