@@ -7,7 +7,7 @@ from bot.block_state import BlockStateTransformer, RecurrentTrainerWrapper
 from datasets import load_dataset
 
 # Argument parser
-parser = argparse.ArgumentParser(description='Evaluate a BlockStateTransformer model on LRA benchmark.')
+parser = argparse.ArgumentParser(description='Evaluate a Transformer model on LRA benchmark.')
 parser.add_argument('--model_checkpoint', type=str, required=True, help='Path to the model checkpoint to be evaluated.')
 parser.add_argument('--task', type=str, required=True, choices=['listops', 'text', 'retrieval', 'image', 'pathfinder', 'pathx'], help='The LRA task to evaluate on.')
 args = parser.parse_args()
