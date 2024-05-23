@@ -37,7 +37,7 @@ def main(args):
 
     # Load the model
     model = BlockStateTransformer(
-        num_tokens=50257,  # Assuming GPT-2 tokenizer
+        num_tokens=256,
         dim=512,
         depth=6,
         dim_head=64,
