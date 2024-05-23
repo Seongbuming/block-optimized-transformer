@@ -1,8 +1,8 @@
 import argparse
-import gzip
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
+from datasets import load_dataset
 from bot.block_state import BlockStateTransformer, RecurrentTrainerWrapper
 
 class TextDataset(Dataset):
@@ -11,12 +11,12 @@ class TextDataset(Dataset):
         self.seq_len = seq_len
 
     def __getitem__(self, index):
-        rand_start = torch.randint(0, self.data.size(0) - self.seq_len, (1,))
-        full_seq = self.data[rand_start : rand_start + self.seq_len + 1].long()
-        return full_seq
+        rand_start = torch.randint(0, len(self.data) - self.seq_len, (1,))
+        full_seq = self.data[rand_start : rand_start + self.seq_len + 1]
+        return torch.tensor(full_seq, dtype=torch.long)
 
     def __len__(self):
-        return self.data.size(0) // self.seq_len
+        return len(self.data) // self.seq_len
 
 def calculate_perplexity(model, data_loader, device):
     model.eval()
@@ -52,18 +52,17 @@ def main(args):
     model.load_state_dict(torch.load(args.model_checkpoint))
     model.to(device)
 
-    # Load datasets
+    # Load datasets from Hugging Face
     datasets = {
-        "PG19": "./data/pg19.gz",
-        "arXiv": "./data/arxiv.gz",
-        "GitHub": "./data/github.gz",
+        "PG19": load_dataset("pg19"),
+        "arXiv": load_dataset("arxiv_dataset"),
+        "GitHub": load_dataset("codeparrot/github-code")
     }
 
     results = {}
-    for name, path in datasets.items():
-        with gzip.open(path, 'rb') as file:
-            data = np.frombuffer(file.read(), dtype=np.uint8).copy()
-        dataset = TextDataset(torch.from_numpy(data), args.seq_len)
+    for name, dataset in datasets.items():
+        data = dataset['train']['text'] if 'text' in dataset['train'].features else dataset['train']['content']
+        dataset = TextDataset(data, args.seq_len)
         data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
         # Calculate perplexity
