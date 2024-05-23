@@ -1,3 +1,4 @@
+import argparse
 import gzip
 import random
 import tqdm
@@ -22,6 +23,12 @@ PRIME_LENGTH = 128
 GENERATE_EVERY = 250
 GENERATE_LENGTH = 2048
 SEQ_LEN = 2048
+SAVE_MODEL_EVERY = 1000
+
+# Argument parser
+parser = argparse.ArgumentParser(description='Train a Transformer model.')
+parser.add_argument('--model_name', type=str, default='model', help='The base name for the saved model files.')
+args = parser.parse_args()
 
 # helpers
 
@@ -132,3 +139,7 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10.0, desc="training"):
         sample = train_wrapper.generate(inp[None, ...], length = GENERATE_LENGTH)
         output_str = decode_tokens(sample[0])
         acc_print(f" output_str: {output_str}\n\n")
+
+    if i % SAVE_MODEL_EVERY == 0:
+        torch.save(model.state_dict(), f"checkpoints/{args.model_name}_{i}.pt")
+        acc_print(f"Model saved at iteration {i} as {args.model_name}_{i}.pt")
