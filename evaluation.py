@@ -37,7 +37,7 @@ def main(args):
 
     # Load the model
     model = BlockStateTransformer(
-        num_tokens=256,
+        num_tokens=256,  # Byte-level tokens (0-255)
         dim=512,
         depth=6,
         dim_head=64,
@@ -54,15 +54,16 @@ def main(args):
 
     # Load datasets from Hugging Face
     datasets = {
-        "PG19": load_dataset("pg19"),
-        "arXiv": load_dataset("arxiv_dataset"),
+        "PG19": load_dataset("deepmind/pg19"),
+        # "arXiv": load_dataset("MaartenGr/arxiv_nlp"),
         "GitHub": load_dataset("codeparrot/github-code")
     }
 
     results = {}
     for name, dataset in datasets.items():
         data = dataset['train']['text'] if 'text' in dataset['train'].features else dataset['train']['content']
-        dataset = TextDataset(data, args.seq_len)
+        data = [ord(char) for char in data]  # Convert characters to byte-level tokens
+        dataset = TextDataset(torch.tensor(data, dtype=torch.uint8), args.seq_len)
         data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
         # Calculate perplexity
