@@ -790,7 +790,8 @@ class AttentionBlock(nn.Module):
 
         self.to_kv = nn.Linear(dim, dim_head * 2, bias = False)
 
-        self.attn = Attention(dim_head, qk_rmsnorm = qk_rmsnorm, qk_rmsnorm_scale = qk_rmsnorm_scale, use_flash_attn = use_flash_attn)
+        # self.attn = Attention(dim_head, qk_rmsnorm = qk_rmsnorm, qk_rmsnorm_scale = qk_rmsnorm_scale, use_flash_attn = use_flash_attn)
+        self.attn = LinearAttention(dim, heads=heads, dim_head=dim_head)
 
         self.block_width = block_width
         self.is_recurrent_layer = num_state_vectors > 0
@@ -865,11 +866,14 @@ class AttentionBlock(nn.Module):
 
         # attention, but of course
 
+        rotary_freqs, scale = None, None
+        if rotary_pos_emb is not None:
+            rotary_freqs, scale = rotary_pos_emb()
+        
         out = self.attn(
-            q, k, v,
-            rotary_pos_emb = rotary_pos_emb,
-            xpos_scale = xpos_scale,
-            mask = attn_mask
+            x,
+            rotary_pos_emb=rotary_freqs,
+            scale=scale
         )
 
         # merge heads
