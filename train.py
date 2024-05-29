@@ -10,7 +10,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from accelerate import Accelerator
-from bot.block_state import BlockStateTransformer, RecurrentTrainerWrapper
+import bot.block_optimized as bot, bot.block_state as bst
 
 # constants
 
@@ -27,7 +27,7 @@ SAVE_MODEL_EVERY = 1000
 
 # Argument parser
 parser = argparse.ArgumentParser(description='Train a Transformer model.')
-parser.add_argument('--model_name', type=str, default='model', help='The base name for the saved model files.')
+parser.add_argument('--model_name', type=str, default='bot', choices=['bot', 'bst'], help='The base name for the saved model files.')
 args = parser.parse_args()
 
 # helpers
@@ -53,25 +53,44 @@ acc_print = accelerator.print
 
 # instantiate palm
 
-model = BlockStateTransformer(
-    num_tokens = 256,
-    dim = 512,
-    depth = 6,
-    dim_head = 64,
-    heads = 8,
-    max_seq_len = 512,
-    block_width = 512,
-    num_state_vectors = 512,
-    recurrent_layers = (4,),
-    use_flash_attn = True,
-    s4_n_ssm=64,
-)
-
-train_wrapper = RecurrentTrainerWrapper(
-    model,
-    xl_memories_dropout = 0.1,
-    state_dropout = 0.1,
-)
+if args.model_name == 'bst':
+    model = bst.BlockStateTransformer(
+        num_tokens = 256,
+        dim = 512,
+        depth = 6,
+        dim_head = 64,
+        heads = 8,
+        max_seq_len = 512,
+        block_width = 512,
+        num_state_vectors = 512,
+        recurrent_layers = (4,),
+        use_flash_attn = True,
+        s4_n_ssm=64,
+    )
+    train_wrapper = bst.RecurrentTrainerWrapper(
+        model,
+        xl_memories_dropout = 0.1,
+        state_dropout = 0.1,
+    )
+elif args.model_name == 'bot':
+    model = bot.BlockOptimizedTransformer(
+        num_tokens = 256,
+        dim = 512,
+        depth = 6,
+        dim_head = 64,
+        heads = 8,
+        max_seq_len = 512,
+        block_width = 512,
+        num_state_vectors = 512,
+        recurrent_layers = (4,),
+        use_flash_attn = True,
+        s4_n_ssm=64,
+    )
+    train_wrapper = bot.RecurrentTrainerWrapper(
+        model,
+        xl_memories_dropout = 0.1,
+        state_dropout = 0.1,
+    )
 
 model.to(device)
 

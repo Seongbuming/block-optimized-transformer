@@ -194,29 +194,6 @@ def apply_rotary_pos_emb(t, pos, scale = 1.):
     return (t * pos.cos() * scale) + (rotate_half(t) * pos.sin() * scale)
 
 # SSM Layer (State Space Model)
-# class S4Layer(nn.Module):
-#     def __init__(self, d_model, n_ssm=8):
-#         super(S4Layer, self).__init__()
-#         self.d_model = d_model
-#         self.n_ssm = n_ssm
-
-#         self.ssms = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(n_ssm)])
-#         self.scale = nn.Parameter(torch.ones(n_ssm))
-
-#     def forward(self, x):
-#         batch_size, seq_len, dim = x.shape
-#         assert dim == self.d_model, f"Input dimension ({dim}) does not match layer dimension ({self.d_model})"
-
-#         context_seq = torch.zeros_like(x)
-
-#         for i in range(self.n_ssm):
-#             ssm = self.ssms[i]
-#             reshaped_x = x.view(-1, dim)  # (batch_size * seq_len, dim)
-#             transformed_x = ssm(reshaped_x)  # Perform linear transformation
-#             transformed_x = transformed_x.view(batch_size, seq_len, dim)  # (batch_size, seq_len, dim)
-#             context_seq = context_seq + self.scale[i] * transformed_x
-
-#         return context_seq
 
 class S4Layer(nn.Module):
     def __init__(self, d_model, seq_len, N=64):
@@ -672,47 +649,6 @@ def FeedForward(dim, mult = 4):
 
 # attention
 
-class LinearAttention(nn.Module):
-    def __init__(
-        self,
-        dim,
-        heads=8,
-        dim_head=64
-    ):
-        super().__init__()
-        self.heads = heads
-        self.dim_head = dim_head
-        inner_dim = dim_head * heads
-
-        self.to_q = nn.Linear(dim, inner_dim, bias=False)
-        self.to_k = nn.Linear(dim, inner_dim, bias=False)
-        self.to_v = nn.Linear(dim, inner_dim, bias=False)
-        self.to_out = nn.Linear(inner_dim, dim, bias=False)
-
-    def forward(
-        self,
-        x,
-        rotary_pos_emb=None,
-        scale=None
-    ):
-        b, n, _ = x.shape
-        h = self.heads
-
-        q = self.to_q(x)
-        k = self.to_k(x)
-        v = self.to_v(x)
-
-        q = rearrange(q, 'b n (h d) -> b h n d', h=h)
-        k = rearrange(k, 'b n (h d) -> b h n d', h=h)
-        v = rearrange(v, 'b n (h d) -> b h n d', h=h)
-
-        if rotary_pos_emb is not None:
-            q = apply_rotary_pos_emb(q, rotary_pos_emb, scale)
-            k = apply_rotary_pos_emb(k, rotary_pos_emb, scale)
-        
-        q = q.softmax(dim=-1)
-        k = k.softmax(dim=-1)
-
 class Attention(nn.Module):
     def __init__(
         self,
@@ -790,8 +726,7 @@ class AttentionBlock(nn.Module):
 
         self.to_kv = nn.Linear(dim, dim_head * 2, bias = False)
 
-        # self.attn = Attention(dim_head, qk_rmsnorm = qk_rmsnorm, qk_rmsnorm_scale = qk_rmsnorm_scale, use_flash_attn = use_flash_attn)
-        self.attn = LinearAttention(dim, heads=heads, dim_head=dim_head)
+        self.attn = Attention(dim_head, qk_rmsnorm = qk_rmsnorm, qk_rmsnorm_scale = qk_rmsnorm_scale, use_flash_attn = use_flash_attn)
 
         self.block_width = block_width
         self.is_recurrent_layer = num_state_vectors > 0
@@ -866,14 +801,11 @@ class AttentionBlock(nn.Module):
 
         # attention, but of course
 
-        rotary_freqs, scale = None, None
-        if rotary_pos_emb is not None:
-            rotary_freqs, scale = rotary_pos_emb()
-        
         out = self.attn(
-            x,
-            rotary_pos_emb=rotary_freqs,
-            scale=scale
+            q, k, v,
+            rotary_pos_emb = rotary_pos_emb,
+            xpos_scale = xpos_scale,
+            mask = attn_mask
         )
 
         # merge heads
@@ -911,7 +843,7 @@ class AttentionBlock(nn.Module):
 # classes
 
 @beartype
-class BlockStateTransformer(nn.Module):
+class BlockOptimizedTransformer(nn.Module):
     def __init__(
         self,
         *,
@@ -1234,7 +1166,7 @@ class BlockStateTransformer(nn.Module):
 class RecurrentTrainerWrapper(nn.Module):
     def __init__(
         self,
-        transformer: BlockStateTransformer,
+        transformer: BlockOptimizedTransformer,
         xl_memories_dropout = 0.,
         state_dropout = 0.
     ):
