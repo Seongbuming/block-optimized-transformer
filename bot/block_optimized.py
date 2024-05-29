@@ -196,20 +196,18 @@ def apply_rotary_pos_emb(t, pos, scale = 1.):
 # SSM Layer (State Space Model)
 
 class S4Layer(nn.Module):
-    def __init__(self, d_model, seq_len, N=64):
+    def __init__(self, d_model, seq_len):
         super(S4Layer, self).__init__()
         self.d_model = d_model
         self.seq_len = seq_len
 
         # Adaptive SSM
-        if N is None:
-            self.N = max(8, seq_len // 64)
-        self.N = N  # State size
+        self.N = max(8, seq_len // 64)  # State size
 
         # Initialize the state space parameters A, B, C
-        self.A = nn.Parameter(torch.randn(N, N) * 0.01)
-        self.B = nn.Parameter(torch.randn(N, 1) * 0.01)
-        self.C = nn.Parameter(torch.randn(1, N) * 0.01)
+        self.A = nn.Parameter(torch.randn(self.N, self.N) * 0.01)
+        self.B = nn.Parameter(torch.randn(self.N, 1) * 0.01)
+        self.C = nn.Parameter(torch.randn(1, self.N) * 0.01)
 
         # Create the SSM kernel using HiPPO framework
         self.K = self._compute_ssm_kernel()
@@ -379,7 +377,6 @@ class StateContainer(nn.Module):
         qk_rmsnorm = False,
         qk_rmsnorm_scale = 8,
         use_flash_attn = False,
-        s4_n_ssm = 8,
         seq_len = 512
     ):
         super().__init__()
@@ -406,7 +403,7 @@ class StateContainer(nn.Module):
         self.from_state_cross_attn = Attention(dim_head, qk_rmsnorm=qk_rmsnorm, qk_rmsnorm_scale=qk_rmsnorm_scale, use_flash_attn=use_flash_attn)
 
         # S4 layer
-        self.s4_layer = S4Layer(dim, seq_len=seq_len, N=s4_n_ssm)
+        self.s4_layer = S4Layer(dim, seq_len=seq_len)
 
         # gating related parameters - using the fixed simple config
         self.state_out_to_gate = nn.Linear(dim, dim)
@@ -717,7 +714,6 @@ class AttentionBlock(nn.Module):
         num_state_vectors = 0,
         num_external_state_reads = 0,
         state_read_before_write = True,  # this will be defaulted to on as in the paper, but will be turned off in the case the researcher wants to test out reading the state at a lower layer
-        s4_n_ssm = 64, # number of SSMs in S4Layer
         seq_len = 512 # sequence length for S4Layer
     ):
         super().__init__()
@@ -754,7 +750,6 @@ class AttentionBlock(nn.Module):
             qk_rmsnorm = qk_rmsnorm,
             qk_rmsnorm_scale = qk_rmsnorm_scale,
             use_flash_attn = use_flash_attn,
-            s4_n_ssm = s4_n_ssm,
             seq_len = seq_len
         )
 
@@ -866,8 +861,7 @@ class BlockOptimizedTransformer(nn.Module):
         ignore_index = -100,
         use_flash_attn = False,
         use_compressed_mem = False,
-        compressed_mem_factor = 4,
-        s4_n_ssm = 64
+        compressed_mem_factor = 4
     ):
         super().__init__()
         num_state_vectors = default(num_state_vectors, block_width)
@@ -927,7 +921,6 @@ class BlockOptimizedTransformer(nn.Module):
                 use_flash_attn = use_flash_attn,
                 num_external_state_reads = num_external_state_reads,
                 state_read_before_write = False,
-                s4_n_ssm = s4_n_ssm,
                 seq_len = max_seq_len
             )
 
