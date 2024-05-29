@@ -200,6 +200,10 @@ class S4Layer(nn.Module):
         super(S4Layer, self).__init__()
         self.d_model = d_model
         self.seq_len = seq_len
+
+        # Adaptive SSM
+        if N is None:
+            self.N = max(8, seq_len // 64)
         self.N = N  # State size
 
         # Initialize the state space parameters A, B, C
