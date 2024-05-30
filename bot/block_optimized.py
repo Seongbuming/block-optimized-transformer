@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 import torch.fft
 from torch import nn, einsum
+from torch.quantization import QuantStub, DeQuantStub, quantize_dynamic, float_qparams_weight_only_qconfig
 
 from einops import rearrange, repeat, pack, unpack
 from einops.layers.torch import Rearrange
@@ -212,12 +213,16 @@ class S4Layer(nn.Module):
         # Create the SSM kernel using HiPPO framework
         self.K = self._compute_ssm_kernel()
 
+        # Quantization stubs
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
+
     def _compute_ssm_kernel(self):
         # Compute the SSM kernel K
         L = self.seq_len
         K = torch.zeros(L, device=self.A.device)
 
-        # Example computation of K using A, B, C matrices
+        # Compute K using A, B, C matrices
         CAkB = self.C @ self.B
         K[0] = CAkB
         Ak = torch.eye(self.N, device=self.A.device)
@@ -229,6 +234,7 @@ class S4Layer(nn.Module):
         return K
 
     def forward(self, x):
+        x = self.quant(x)
         batch_size, seq_len, dim = x.shape
         assert dim == self.d_model, f"Input dimension ({dim}) does not match layer dimension ({self.d_model})"
 
@@ -250,6 +256,7 @@ class S4Layer(nn.Module):
 
         # Normalized output
         y = F.layer_norm(y, y.shape[1:])
+        y = self.dequant(y)
 
         return y
 
@@ -863,7 +870,7 @@ class BlockOptimizedTransformer(nn.Module):
         use_compressed_mem = False,
         compressed_mem_factor = 4
     ):
-        super().__init__()
+        super(BlockOptimizedTransformer, self).__init__()
         num_state_vectors = default(num_state_vectors, block_width)
 
         # set recurrent layers
@@ -888,6 +895,7 @@ class BlockOptimizedTransformer(nn.Module):
         # token embedding
 
         self.token_emb = nn.Embedding(num_tokens, dim)
+        self.token_emb.qconfig = float_qparams_weight_only_qconfig
 
         self.rotary_pos_emb = RotaryEmbedding(dim = dim_head, width = (2 if not use_compressed_mem else 3) * block_width)
 
@@ -959,6 +967,10 @@ class BlockOptimizedTransformer(nn.Module):
         self.ignore_index = ignore_index
 
         self.register_buffer('cached_causal_attn_mask', None, persistent = False)
+
+        # Quantization stubs
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
 
     @property
     def device(self):
@@ -1034,6 +1046,7 @@ class BlockOptimizedTransformer(nn.Module):
         states: List[torch.Tensor] = [],
         return_memories_and_states = None  # can force to either return memory + state or not. by default will only return when number of tokens == max_seq_len
     ):
+        x = self.quant(x)
         device = x.device
 
         if return_loss:
@@ -1139,6 +1152,7 @@ class BlockOptimizedTransformer(nn.Module):
         # project to logits
 
         logits = self.to_logits(out)
+        logits = self.dequant(logits)
 
         # detach the states and memories
 

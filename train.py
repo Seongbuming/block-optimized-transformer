@@ -1,6 +1,7 @@
 import argparse
 import gzip
 import random
+import torch.ao.quantization
 import tqdm
 import numpy as np
 
@@ -8,6 +9,8 @@ import torch
 from torch.optim import Adam
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
+from torch.quantization import default_qconfig, get_default_qconfig, prepare, convert
+from torch.quantization.quantize_fx import prepare_fx, convert_fx
 
 from accelerate import Accelerator
 import bot.block_optimized as bot, bot.block_state as bst
@@ -84,7 +87,6 @@ elif args.model_name == 'bot':
         num_state_vectors = 512,
         recurrent_layers = (4,),
         use_flash_attn = True,
-        s4_n_ssm=64,
     )
     train_wrapper = bot.RecurrentTrainerWrapper(
         model,
@@ -128,6 +130,11 @@ model, optim, train_loader, val_loader = accelerator.prepare(
     model, optim, train_loader, val_loader
 )
 
+if args.model_name == 'bot':
+    # model.qconfig = torch.ao.quantization.get_default_qat_qconfig('fbgemm')
+    model.qconfig = default_qconfig
+    prepare(model, inplace=True)
+
 # training
 
 for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10.0, desc="training"):
@@ -162,3 +169,5 @@ for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10.0, desc="training"):
     if i % SAVE_MODEL_EVERY == 0:
         torch.save(model.state_dict(), f"checkpoints/{args.model_name}_{i}.pt")
         acc_print(f"Model saved at iteration {i} as {args.model_name}_{i}.pt")
+
+convert(model, inplace=True)
