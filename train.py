@@ -70,11 +70,14 @@ if args.model_name == 'bst':
         use_flash_attn = True,
         s4_n_ssm=64,
     )
+
     train_wrapper = bst.RecurrentTrainerWrapper(
         model,
         xl_memories_dropout = 0.1,
         state_dropout = 0.1,
     )
+
+    model.to(device)
 elif args.model_name == 'bot':
     model = bot.BlockOptimizedTransformer(
         num_tokens = 256,
@@ -88,13 +91,22 @@ elif args.model_name == 'bot':
         recurrent_layers = (4,),
         use_flash_attn = True,
     )
+
     train_wrapper = bot.RecurrentTrainerWrapper(
         model,
         xl_memories_dropout = 0.1,
         state_dropout = 0.1,
     )
 
-model.to(device)
+    model.qconfig = torch.ao.quantization.get_default_qat_qconfig('fbgemm')
+    embedding_layer = model.token_emb
+    model.token_emb = torch.nn.Identity()
+    prepare(model, inplace=True)
+
+    model.token_emb = embedding_layer
+    convert(model, inplace=True)
+
+    model.to(device)
 
 # prepare enwik8 data
 
@@ -129,11 +141,6 @@ optim = Adam(model.parameters(), lr = LEARNING_RATE)
 model, optim, train_loader, val_loader = accelerator.prepare(
     model, optim, train_loader, val_loader
 )
-
-if args.model_name == 'bot':
-    # model.qconfig = torch.ao.quantization.get_default_qat_qconfig('fbgemm')
-    model.qconfig = default_qconfig
-    prepare(model, inplace=True)
 
 # training
 
